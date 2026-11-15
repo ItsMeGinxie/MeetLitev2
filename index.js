@@ -10,18 +10,17 @@ const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
+// Server health check
 app.get('/', (_req, res) => {
   res.json({
     app: 'Meet Lite signaling server',
-    status: 'ok',
-    message: 'Server is running'
+    status: 'ok'
   });
 });
 
 app.get('/health', (_req, res) => {
-  res.status(200).json({
-    status: 'healthy',
-    app: 'Meet Lite signaling server'
+  res.json({
+    status: 'ok'
   });
 });
 
@@ -32,40 +31,34 @@ const io = new Server(server, {
     origin: '*',
     methods: ['GET', 'POST']
   },
-  transports: ['polling', 'websocket'],
+  transports: ['websocket', 'polling'],
   allowEIO3: true
 });
 
+// roomId -> Map(socketId, { name, cameraOff })
 const rooms = new Map();
-const RECONNECT_GRACE_PERIOD = 30000;
 
-function generateRoomCode() {
+// Generate a six-character meeting code.
+function makeRoomCode() {
+  return crypto
+    .randomBytes(4)
+    .toString('hex')
+    .slice(0, 6)
+    .toUpperCase();
+}
+
+function createUniqueRoomCode() {
   let code;
 
   do {
-    code = crypto
-      .randomBytes(4)
-      .toString('hex')
-      .substring(0, 6)
-      .toUpperCase();
+    code = makeRoomCode();
   } while (rooms.has(code));
 
   return code;
 }
 
-function getDisplayName(name) {
-  return String(name || 'Guest')
-    .trim()
-    .slice(0, 28) || 'Guest';
-}
-
-function respond(callback, result) {
-  if (typeof callback === 'function') {
-    callback(result);
-  }
-}
-
-function getPublicUser(id, user) {
+// Get a safe participant object for clients.
+function getParticipant(id, user) {
   return {
     id,
     name: user.name,
@@ -73,281 +66,7 @@ function getPublicUser(id, user) {
   };
 }
 
-async function createRoom(socket, data, callback) {
-  try {
-    if (socket.data.roomId) {
-      return respond(callback, {
-        ok: false,
-        error: 'You are already in a meeting.'
-      });
-    }
-
-    const roomId = generateRoomCode();
-    const name = getDisplayName(data?.name);
-
-    const room = new Map();
-
-    room.set(socket.id, {
-      name,
-      cameraOff: false,
-      disconnected: false,
-      disconnectTimer: null
-    });
-
-    rooms.set(roomId, room);
-
-    await socket.join(roomId);
-
-    socket.data.roomId = roomId;
-    socket.data.name = name;
-
-    socket.emit('room-users', []);
-
-    console.log('ROOM CREATED:', roomId);
-    console.log('CREATOR:', name);
-
-    respond(callback, {
-      ok: true,
-      roomId
-    });
-
-  } catch (error) {
-    console.error('CREATE ROOM ERROR:', error);
-
-    respond(callback, {
-      ok: false,
-      error: 'Server error while creating the meeting.'
-    });
-  }
-}
-
-async function joinRoom(socket, data, callback) {
-  try {
-    if (socket.data.roomId) {
-      return respond(callback, {
-        ok: false,
-        error: 'You are already in a meeting.'
-      });
-    }
-
-    const roomId = String(data?.roomId || '')
-      .trim()
-      .toUpperCase();
-
-    if (!roomId) {
-      return respond(callback, {
-        ok: false,
-        error: 'Please enter a meeting code.'
-      });
-    }
-
-    const room = rooms.get(roomId);
-
-    if (!room || room.size === 0) {
-      return respond(callback, {
-        ok: false,
-        error: 'Meeting not found. Please check the meeting code.'
-      });
-    }
-
-    const name = getDisplayName(data?.name);
-
-    const existingUsers = [...room.entries()]
-      .filter(([, user]) => !user.disconnected)
-      .map(([id, user]) => getPublicUser(id, user));
-
-    await socket.join(roomId);
-
-    socket.data.roomId = roomId;
-    socket.data.name = name;
-
-    room.set(socket.id, {
-      name,
-      cameraOff: false,
-      disconnected: false,
-      disconnectTimer: null
-    });
-
-    socket.emit('room-users', existingUsers);
-
-    socket.to(roomId).emit('user-joined', {
-      id: socket.id,
-      name,
-      cameraOff: false
-    });
-
-    console.log('USER JOINED:', name);
-    console.log('MEETING CODE:', roomId);
-    console.log('PARTICIPANTS:', room.size);
-
-    respond(callback, {
-      ok: true,
-      roomId
-    });
-
-  } catch (error) {
-    console.error('JOIN ROOM ERROR:', error);
-
-    respond(callback, {
-      ok: false,
-      error: 'Server error while joining the meeting.'
-    });
-  }
-}
-
-// RESUME A TEMPORARILY DISCONNECTED PARTICIPANT
-
-async function resumeRoom(socket, data, callback) {
-  try {
-    if (socket.data.roomId) {
-      return respond(callback, {
-        ok: false,
-        error: 'You are already in a meeting.'
-      });
-    }
-
-    const roomId = String(data?.roomId || '')
-      .trim()
-      .toUpperCase();
-
-    const previousSocketId = String(
-      data?.previousSocketId || ''
-    );
-
-    const room = rooms.get(roomId);
-
-    if (!room || !previousSocketId) {
-      return respond(callback, {
-        ok: false,
-        error: 'The meeting could not be recovered. Please rejoin.'
-      });
-    }
-
-    const previousUser = room.get(previousSocketId);
-
-    if (!previousUser || !previousUser.disconnected) {
-      return respond(callback, {
-        ok: false,
-        error: 'Your previous meeting connection has expired. Please rejoin.'
-      });
-    }
-
-    if (previousUser.disconnectTimer) {
-      clearTimeout(previousUser.disconnectTimer);
-    }
-
-    const name = previousUser.name;
-    const cameraOff = Boolean(previousUser.cameraOff);
-
-    room.delete(previousSocketId);
-
-    room.set(socket.id, {
-      name,
-      cameraOff,
-      disconnected: false,
-      disconnectTimer: null
-    });
-
-    await socket.join(roomId);
-
-    socket.data.roomId = roomId;
-    socket.data.name = name;
-
-    const existingUsers = [...room.entries()]
-      .filter(([id, user]) =>
-        id !== socket.id && !user.disconnected
-      )
-      .map(([id, user]) => getPublicUser(id, user));
-
-    socket.emit('room-users', existingUsers);
-
-    socket.to(roomId).emit('user-reconnected', {
-      oldId: previousSocketId,
-      id: socket.id,
-      name,
-      cameraOff
-    });
-
-    console.log('USER RECONNECTED:', name);
-    console.log('MEETING CODE:', roomId);
-
-    respond(callback, {
-      ok: true,
-      roomId
-    });
-
-  } catch (error) {
-    console.error('RESUME ROOM ERROR:', error);
-
-    respond(callback, {
-      ok: false,
-      error: 'Server error while restoring the meeting.'
-    });
-  }
-}
-
-// CAMERA STATE SYNCHRONIZATION
-
-function updateCameraState(socket, data) {
-  const roomId = socket.data.roomId;
-
-  if (!roomId) return;
-
-  const room = rooms.get(roomId);
-
-  if (!room) return;
-
-  const user = room.get(socket.id);
-
-  if (!user || user.disconnected) return;
-
-  const cameraOff = Boolean(data?.cameraOff);
-
-  user.cameraOff = cameraOff;
-
-  socket.to(roomId).emit('camera-state', {
-    id: socket.id,
-    cameraOff
-  });
-
-  console.log(
-    'CAMERA STATE:',
-    user.name,
-    cameraOff ? 'OFF' : 'ON'
-  );
-}
-
-// REMOVE A USER COMPLETELY
-
-function removeUserFromRoom(roomId, socketId) {
-  const room = rooms.get(roomId);
-
-  if (!room) return;
-
-  const user = room.get(socketId);
-
-  if (!user) return;
-
-  if (user.disconnectTimer) {
-    clearTimeout(user.disconnectTimer);
-  }
-
-  room.delete(socketId);
-
-  io.to(roomId).emit('user-left', {
-    id: socketId
-  });
-
-  if (room.size === 0) {
-    rooms.delete(roomId);
-    console.log('ROOM DELETED:', roomId);
-  } else {
-    console.log('PARTICIPANTS REMAINING:', room.size);
-  }
-}
-
-// INTENTIONAL LEAVE
-
+// Remove a participant from their current room.
 function leaveRoom(socket) {
   const roomId = socket.data.roomId;
 
@@ -355,109 +74,175 @@ function leaveRoom(socket) {
 
   const room = rooms.get(roomId);
 
-  socket.leave(roomId);
-
   if (room) {
-    const user = room.get(socket.id);
-
-    if (user?.disconnectTimer) {
-      clearTimeout(user.disconnectTimer);
-    }
-
     room.delete(socket.id);
 
-    io.to(roomId).emit('user-left', {
+    // Notify remaining participants.
+    socket.to(roomId).emit('user-left', {
       id: socket.id
     });
 
+    // Delete empty rooms.
     if (room.size === 0) {
       rooms.delete(roomId);
-      console.log('ROOM DELETED:', roomId);
-    } else {
-      console.log('PARTICIPANTS REMAINING:', room.size);
+      console.log(`Room deleted: ${roomId}`);
     }
   }
 
-  console.log(
-    `${socket.data.name || 'Guest'} left room ${roomId}`
-  );
+  socket.leave(roomId);
 
   delete socket.data.roomId;
   delete socket.data.name;
 }
 
-// TEMPORARY DISCONNECTION
+// Join an existing room.
+function joinExistingRoom(
+  socket,
+  roomId,
+  name,
+  acknowledge
+) {
+  const key = String(roomId || '')
+    .trim()
+    .toUpperCase()
+    .slice(0, 20);
 
-function handleTemporaryDisconnect(socket) {
-  const roomId = socket.data.roomId;
+  const displayName = String(name || 'Guest')
+    .trim()
+    .slice(0, 28) || 'Guest';
 
-  if (!roomId) return;
+  if (!key) {
+    acknowledge?.({
+      ok: false,
+      error: 'Enter a meeting code first.'
+    });
+    return;
+  }
 
-  const room = rooms.get(roomId);
+  const room = rooms.get(key);
 
-  if (!room) return;
+  if (!room) {
+    acknowledge?.({
+      ok: false,
+      error: 'Meeting not found. Check the code or ask the host to create a meeting.'
+    });
+    return;
+  }
 
-  const user = room.get(socket.id);
+  // Leave the previous room first, if necessary.
+  if (socket.data.roomId) {
+    leaveRoom(socket);
+  }
 
-  if (!user) return;
+  // Get existing participants before adding the new participant.
+  const existingUsers = [...room.entries()].map(
+    ([id, user]) => getParticipant(id, user)
+  );
 
-  user.disconnected = true;
+  socket.join(key);
 
-  user.disconnectTimer = setTimeout(() => {
-    const currentRoom = rooms.get(roomId);
+  socket.data.roomId = key;
+  socket.data.name = displayName;
 
-    if (!currentRoom) return;
+  // New participants start with their camera on.
+  const newUser = {
+    name: displayName,
+    cameraOff: false
+  };
 
-    const currentUser = currentRoom.get(socket.id);
+  room.set(socket.id, newUser);
 
-    if (!currentUser || !currentUser.disconnected) {
-      return;
-    }
+  // Send the existing participants to the new participant.
+  socket.emit('room-users', existingUsers);
 
-    console.log(
-      'RECONNECTION TIME EXPIRED:',
-      currentUser.name,
-      roomId
-    );
+  // Notify existing participants about the new participant.
+  socket.to(key).emit(
+    'user-joined',
+    getParticipant(socket.id, newUser)
+  );
 
-    removeUserFromRoom(roomId, socket.id);
-
-  }, RECONNECT_GRACE_PERIOD);
+  acknowledge?.({
+    ok: true,
+    roomId: key
+  });
 
   console.log(
-    'TEMPORARY DISCONNECTION:',
-    user.name,
-    roomId
+    `${displayName} joined room ${key}`
   );
 }
 
-// SOCKET CONNECTION
-
+// Socket.IO connections.
 io.on('connection', socket => {
-  console.log('--------------------------------');
-  console.log('CLIENT CONNECTED:', socket.id);
-  console.log('TRANSPORT:', socket.conn.transport.name);
+  console.log('Client connected:', socket.id);
 
-  socket.onAny(event => {
-    console.log('EVENT RECEIVED:', event);
+  // CREATE ROOM
+  socket.on('create-room', (payload = {}, acknowledge) => {
+    if (socket.data.roomId) {
+      leaveRoom(socket);
+    }
+
+    const roomId = createUniqueRoomCode();
+
+    rooms.set(roomId, new Map());
+
+    joinExistingRoom(
+      socket,
+      roomId,
+      payload.name,
+      acknowledge
+    );
+
+    console.log(
+      `Room created: ${roomId} by ${socket.id}`
+    );
   });
 
-  socket.on('create-room', (data, callback) => {
-    createRoom(socket, data || {}, callback);
+  // JOIN ROOM
+  // This event only joins existing rooms.
+  socket.on('join-room', (payload = {}, acknowledge) => {
+    joinExistingRoom(
+      socket,
+      payload.roomId,
+      payload.name,
+      acknowledge
+    );
   });
 
-  socket.on('join-room', (data, callback) => {
-    joinRoom(socket, data || {}, callback);
+  // CAMERA ON / OFF
+  socket.on('camera-state', payload => {
+    const roomId = socket.data.roomId;
+
+    if (!roomId) return;
+
+    const room = rooms.get(roomId);
+
+    if (!room || !room.has(socket.id)) return;
+
+    // Accept either { cameraOff: true/false } or a boolean.
+    const cameraOff = typeof payload === 'boolean'
+      ? payload
+      : Boolean(payload?.cameraOff);
+
+    const user = room.get(socket.id);
+
+    user.cameraOff = cameraOff;
+
+    room.set(socket.id, user);
+
+    // Notify everyone else in the room.
+    socket.to(roomId).emit('camera-state', {
+      id: socket.id,
+      cameraOff
+    });
+
+    console.log(
+      `Camera ${cameraOff ? 'OFF' : 'ON'}: ${socket.id} in ${roomId}`
+    );
   });
 
-  socket.on('resume-room', (data, callback) => {
-    resumeRoom(socket, data || {}, callback);
-  });
-
-  socket.on('camera-state', data => {
-    updateCameraState(socket, data || {});
-  });
-
+  // WEBRTC SIGNALING
+  // Audio and video are transmitted peer-to-peer.
+  // This server only relays signaling messages.
   const signalingEvents = [
     'offer',
     'answer',
@@ -466,64 +251,49 @@ io.on('connection', socket => {
 
   for (const event of signalingEvents) {
     socket.on(event, payload => {
-      try {
-        if (!payload || !payload.to) return;
+      const target = payload?.to;
+      const roomId = socket.data.roomId;
 
-        const roomId = socket.data.roomId;
+      if (!target || !roomId) return;
 
-        if (!roomId) return;
+      const room = rooms.get(roomId);
 
-        const room = rooms.get(roomId);
-
-        if (!room || !room.has(socket.id)) return;
-
-        if (!room.has(payload.to)) return;
-
-        const targetUser = room.get(payload.to);
-
-        if (!targetUser || targetUser.disconnected) return;
-
-        io.to(payload.to).emit(event, {
-          ...payload,
-          from: socket.id
-        });
-
-      } catch (error) {
-        console.error('SIGNALING ERROR:', event, error);
+      // Only allow signaling to participants in the same room.
+      if (!room || !room.has(socket.id) || !room.has(target)) {
+        return;
       }
+
+      io.to(target).emit(event, {
+        ...payload,
+        from: socket.id
+      });
     });
   }
 
+  // LEAVE ROOM
   socket.on('leave-room', () => {
     leaveRoom(socket);
+
+    console.log(
+      'Participant left:', socket.id
+    );
   });
 
+  // DISCONNECT
   socket.on('disconnect', reason => {
-    console.log('CLIENT DISCONNECTED:', socket.id);
-    console.log('REASON:', reason);
+    leaveRoom(socket);
 
-    handleTemporaryDisconnect(socket);
+    console.log(
+      `Client disconnected: ${socket.id} (${reason})`
+    );
   });
-
-  socket.on('error', error => {
-    console.error('SOCKET ERROR:', error);
-  });
-});
-
-// SERVER ERRORS
-
-server.on('error', error => {
-  console.error('HTTP SERVER ERROR:', error);
 });
 
 // START SERVER
-
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('================================');
-  console.log('MEET LITE SERVER STARTED');
-  console.log(`PORT: ${PORT}`);
-  console.log('HOST: 0.0.0.0');
-  console.log('================================');
+  console.log(
+    `Meet Lite signaling server listening on port ${PORT}`
+  );
 });
